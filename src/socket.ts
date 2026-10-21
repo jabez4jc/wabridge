@@ -45,6 +45,9 @@ function resolveJid(to: string): string {
   throw new Error("Invalid recipient. Use phone number, groupId@g.us, or channelId@newsletter");
 }
 
+let stopping = false;
+const RECONNECT_DELAY_MS = 3000;
+
 const bridge: WABridge = {
   sock: null as any,
   status: "disconnected",
@@ -56,22 +59,6 @@ export function getBridge() {
 
 export function getMyJid(): string | null {
   return bridge.sock?.user?.id?.replace(/:\d+@/, "@") || null;
-}
-
-export async function sendMessage(phone: string, message: string) {
-  if (!bridge.sock || bridge.status !== "open") {
-    throw new Error("WhatsApp not connected");
-  }
-  const jid = `${phone}@s.whatsapp.net`;
-  await bridge.sock.sendMessage(jid, { text: message });
-  return { success: true, to: phone };
-}
-
-export async function sendToSelf(message: string) {
-  const myJid = getMyJid();
-  if (!myJid) throw new Error("WhatsApp not connected");
-  await bridge.sock.sendMessage(myJid, { text: message });
-  return { success: true, to: "self" };
 }
 
 export async function sendTo(to: string, content: MessageContent) {
@@ -98,17 +85,18 @@ export async function listGroups() {
 }
 
 export async function disconnect() {
-  if (bridge.sock) {
-    await bridge.sock.logout();
+  stopping = true;
+  try {
+    await bridge.sock?.logout();
+  } finally {
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    bridge.status = "disconnected";
   }
-  fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-  bridge.status = "disconnected";
 }
 
 export function startSocket(callbacks?: {
   onQR?: (qr: string, sock: WASocket) => void;
   onOpen?: () => void;
-  onClose?: () => void;
 }): Promise<WASocket> {
   return new Promise(async (resolve) => {
     bridge.status = "connecting";
@@ -141,15 +129,16 @@ export function startSocket(callbacks?: {
 
         if (connection === "close") {
           bridge.status = "disconnected";
+          if (stopping) return;
           const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
           if (statusCode === DisconnectReason.loggedOut) {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
             console.log("  Logged out. Re-linking...\n");
-            startSocket(callbacks).then(resolve);
-            return;
+          } else {
+            console.log("  Disconnected. Reconnecting...");
           }
-          console.log("  Disconnected. Reconnecting...");
-          startSocket(callbacks).then(resolve);
+          // Delay so a persistent failure (no network, server rejecting) doesn't spin a tight loop
+          setTimeout(() => startSocket(callbacks).then(resolve), RECONNECT_DELAY_MS);
         }
       }
 

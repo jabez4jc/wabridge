@@ -30,8 +30,14 @@ API Endpoints:
   POST /send/channel  Send to channel/newsletter
 
 Options:
+  --code         Link with a pairing code instead of a QR code
   -v, --version  Show version
-  -h, --help     Show this help`);
+  -h, --help     Show this help
+
+Environment:
+  PORT              API port (default: 3000)
+  HOST              Listen address (default: 127.0.0.1)
+  WABRIDGE_API_KEY  Require "Authorization: Bearer <key>" on every request`);
 } else if (command === "start") {
   const port = process.argv[3];
   if (port) process.env.PORT = port;

@@ -166,7 +166,7 @@ All send endpoints (`/send`, `/send/self`, `/send/group`, `/send/channel`) accep
 | `audio` | URL or file path | `ptt?` (default: true) | Voice note or audio file |
 | `document` | URL or file path | `mimetype` (required), `fileName?`, `caption?` | Document attachment |
 
-Media fields accept both remote URLs (`https://...`) and local file paths (`/path/to/file`).
+Media fields accept both remote URLs (`https://...`) and local file paths (`/path/to/file`). See [Security](#security).
 
 ## CLI Commands
 
@@ -204,7 +204,22 @@ Media fields accept both remote URLs (`https://...`) and local file paths (`/pat
 | Option | Default | Description |
 |--------|---------|-------------|
 | Port | `3000` | `wabridge start 8080` or `PORT=8080 wabridge start` |
+| `HOST` | `127.0.0.1` | Interface to listen on. Non-loopback hosts require `WABRIDGE_API_KEY` |
+| `WABRIDGE_API_KEY` | — | When set, every request needs `Authorization: Bearer <key>` |
 | Auth | `~/.wabridge/auth_store` | WhatsApp session credentials |
+
+## Security
+
+Media fields accept local file paths, so anyone who can call the API can send any file the server can read (including your WhatsApp credentials) to any number. For that reason:
+
+- The server listens on `127.0.0.1` only by default, and refuses to bind to another interface unless `WABRIDGE_API_KEY` is set.
+- POST requests must use `Content-Type: application/json`, which stops web pages from posting to the local API.
+- Without an API key, requests with a non-localhost `Host` header are rejected (DNS rebinding protection).
+
+```bash
+WABRIDGE_API_KEY=change-me HOST=0.0.0.0 wabridge start
+curl -H 'Authorization: Bearer change-me' http://your-server:3000/status
+```
 
 ## Requirements
 

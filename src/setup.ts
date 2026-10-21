@@ -1,4 +1,4 @@
-import { startSocket, sendMessage, sendToSelf, sendTo, listGroups, disconnect } from "./socket.js";
+import { startSocket, sendTo, listGroups, disconnect, getBridge, getMyJid } from "./socket.js";
 // @ts-ignore no types available
 import QRCode from "qrcode";
 import * as readline from "readline";
@@ -49,9 +49,6 @@ await startSocket({
       promptLoop();
     }
   },
-  onClose() {
-    process.exit(1);
-  },
 });
 
 async function promptLoop() {
@@ -65,7 +62,6 @@ async function promptLoop() {
     }
 
     if (input === "/status") {
-      const { getBridge, getMyJid } = await import("./socket.js");
       const b = getBridge();
       console.log(`  Status: ${b.status}`);
       console.log(`  JID: ${getMyJid() || "N/A"}`);
@@ -81,7 +77,7 @@ async function promptLoop() {
       const msg = (await ask("  Message: ")).trim();
       if (!msg) { console.log("  Cancelled."); continue; }
       try {
-        await sendMessage(phone, msg);
+        await sendTo(phone, { type: "text", text: msg });
         console.log(`  Sent to +${phone}!`);
       } catch (err: any) {
         console.log(`  Failed: ${err.message}`);
@@ -93,7 +89,9 @@ async function promptLoop() {
       const msg = (await ask("  Message to self: ")).trim();
       if (!msg) { console.log("  Cancelled."); continue; }
       try {
-        await sendToSelf(msg);
+        const myJid = getMyJid();
+        if (!myJid) throw new Error("WhatsApp not connected");
+        await sendTo(myJid, { type: "text", text: msg });
         console.log("  Sent to yourself!");
       } catch (err: any) {
         console.log(`  Failed: ${err.message}`);
