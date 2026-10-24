@@ -2,27 +2,52 @@
 import { makeWASocket, DisconnectReason, useMultiFileAuthState, makeCacheableSignalKeyStore, fetchLatestBaileysVersion } from "baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
+import type { Logger } from "pino";
 import path from "path";
 import os from "os";
 import fs from "fs";
 
-const logger = pino({ level: "silent" });
-
-const AUTH_DIR = path.join(os.homedir(), ".wabridge", "auth_store");
+export const DATA_DIR = process.env.WABRIDGE_HOME || path.join(os.homedir(), ".wabridge");
+export const DEFAULT_AUTH_DIR = path.join(DATA_DIR, "auth_store");
 
 export type WASocket = any;
 
-export interface WABridge {
-  sock: WASocket;
-  status: "connecting" | "open" | "disconnected";
-}
+// connecting/open/disconnected are live states (disconnected = waiting to retry);
+// the rest are terminal: the bridge has stopped and won't reconnect on its own.
+export type Status = "connecting" | "open" | "disconnected" | "replaced" | "logged_out" | "unlinked" | "stopped";
 
 export type MessageContent =
   | { type: "text"; text: string }
   | { type: "image"; url: string; caption?: string }
   | { type: "video"; url: string; caption?: string }
-  | { type: "audio"; url: string; ptt?: boolean }
+  | { type: "audio"; url: string; ptt?: boolean; mimetype?: string }
   | { type: "document"; url: string; mimetype: string; fileName?: string; caption?: string };
+
+export interface WABridgeOptions {
+  authDir?: string;
+  /** Pino-compatible logger passed to Baileys (default: silent) */
+  logger?: Logger;
+  onQR?: (qr: string, sock: WASocket) => void;
+  onStatus?: (status: Status) => void;
+  /** Random gap between sends, [min, max] ms (default: 3000–6000) */
+  sendGapMs?: [number, number];
+}
+
+export const NOT_CONNECTED = "WhatsApp not connected";
+export const NOT_ON_WHATSAPP = "Number is not on WhatsApp";
+
+const MIN_RETRY_MS = 3000;
+const MAX_RETRY_MS = 60000;
+
+/** What to do when the connection closes. Exported for tests. */
+export function closeAction(statusCode: number | undefined, linked: boolean): Status {
+  if (statusCode === DisconnectReason.connectionReplaced) return "replaced";
+  if (statusCode === DisconnectReason.loggedOut) return "logged_out";
+  if (!linked) return "unlinked"; // QR expired unscanned
+  return "disconnected";
+}
+
+export const nextRetryMs = (ms: number) => Math.min(ms * 2, MAX_RETRY_MS);
 
 function buildBaileysContent(content: MessageContent): any {
   switch (content.type) {
@@ -32,119 +57,180 @@ function buildBaileysContent(content: MessageContent): any {
       return { image: { url: content.url }, caption: content.caption };
     case "video":
       return { video: { url: content.url }, caption: content.caption };
-    case "audio":
-      return { audio: { url: content.url }, ptt: content.ptt ?? true };
+    case "audio": {
+      const ptt = content.ptt ?? false;
+      return { audio: { url: content.url }, ptt, mimetype: content.mimetype ?? (ptt ? "audio/ogg; codecs=opus" : "audio/mpeg") };
+    }
     case "document":
       return { document: { url: content.url }, mimetype: content.mimetype, fileName: content.fileName, caption: content.caption };
   }
 }
 
-function resolveJid(to: string): string {
-  if (to.includes("@")) return to;
-  if (/^\d{10,15}$/.test(to)) return `${to}@s.whatsapp.net`;
-  throw new Error("Invalid recipient. Use phone number, groupId@g.us, or channelId@newsletter");
-}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-let stopping = false;
-const RECONNECT_DELAY_MS = 3000;
+export class WABridge {
+  sock: WASocket = null;
+  status: Status = "stopped";
+  qr: string | null = null;
 
-const bridge: WABridge = {
-  sock: null as any,
-  status: "disconnected",
-};
+  readonly authDir: string;
+  private logger: Logger;
+  private stopping = false;
+  private retryMs = MIN_RETRY_MS;
+  private retryTimer?: NodeJS.Timeout;
+  private saving: Promise<void> = Promise.resolve();
+  private sendQueue: Promise<unknown> = Promise.resolve();
+  private nextSendAt = 0;
 
-export function getBridge() {
-  return bridge;
-}
-
-export function getMyJid(): string | null {
-  return bridge.sock?.user?.id?.replace(/:\d+@/, "@") || null;
-}
-
-export async function sendTo(to: string, content: MessageContent) {
-  if (!bridge.sock || bridge.status !== "open") {
-    throw new Error("WhatsApp not connected");
+  constructor(private opts: WABridgeOptions = {}) {
+    this.authDir = opts.authDir ?? DEFAULT_AUTH_DIR;
+    this.logger = opts.logger ?? pino({ level: "silent" });
   }
-  const jid = resolveJid(to);
-  const msg = buildBaileysContent(content);
-  await bridge.sock.sendMessage(jid, msg);
-  return { success: true, to: jid };
-}
 
-export async function listGroups() {
-  if (!bridge.sock || bridge.status !== "open") {
-    throw new Error("WhatsApp not connected");
+  /** Own JID without the device suffix, e.g. 919876543210@s.whatsapp.net */
+  get jid(): string | null {
+    return this.sock?.user?.id?.replace(/:\d+@/, "@") || null;
   }
-  const groups = await bridge.sock.groupFetchAllParticipating();
-  return Object.values(groups).map((g: any) => ({
-    id: g.id,
-    subject: g.subject,
-    size: g.size ?? g.participants?.length ?? 0,
-    desc: g.desc || null,
-  }));
-}
 
-export async function disconnect() {
-  stopping = true;
-  try {
-    await bridge.sock?.logout();
-  } finally {
-    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-    bridge.status = "disconnected";
+  get phone(): string | null {
+    return this.jid?.split("@")[0] || null;
   }
-}
 
-export function startSocket(callbacks?: {
-  onQR?: (qr: string, sock: WASocket) => void;
-  onOpen?: () => void;
-}): Promise<WASocket> {
-  return new Promise(async (resolve) => {
-    bridge.status = "connecting";
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  async start() {
+    this.stopping = false;
+    this.retryMs = MIN_RETRY_MS;
+    await this.connect();
+  }
+
+  /** Close the socket without logging out, flushing pending session writes */
+  async stop() {
+    this.stopping = true;
+    clearTimeout(this.retryTimer);
+    this.sock?.end(undefined);
+    await this.saving;
+    this.setStatus("stopped");
+  }
+
+  /** Unlink this device and delete the saved session */
+  async logout() {
+    this.stopping = true;
+    clearTimeout(this.retryTimer);
+    try {
+      await this.sock?.logout();
+    } finally {
+      fs.rmSync(this.authDir, { recursive: true, force: true });
+      this.setStatus("stopped");
+    }
+  }
+
+  private setStatus(status: Status) {
+    if (status !== "connecting") this.qr = null;
+    if (this.status === status) return;
+    this.status = status;
+    this.opts.onStatus?.(status);
+  }
+
+  private async connect() {
+    this.setStatus("connecting");
+    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     const { version } = await fetchLatestBaileysVersion();
+    if (this.stopping) return;
 
-    console.log(`  Connecting to WhatsApp (v${version.join(".")})...`);
-
-    bridge.sock = makeWASocket({
+    const old = this.sock;
+    const sock = makeWASocket({
       version,
-      logger,
+      logger: this.logger,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
+        keys: makeCacheableSignalKeyStore(state.keys, this.logger),
       },
+      markOnlineOnConnect: false,
       generateHighQualityLinkPreview: true,
     });
+    this.sock = sock;
+    old?.end(undefined);
 
-    bridge.sock.ev.process(async (events: any) => {
-      if (events["connection.update"]) {
-        const { connection, lastDisconnect, qr } = events["connection.update"];
-
-        if (qr) callbacks?.onQR?.(qr, bridge.sock);
-
-        if (connection === "open") {
-          bridge.status = "open";
-          callbacks?.onOpen?.();
-          resolve(bridge.sock);
-        }
-
-        if (connection === "close") {
-          bridge.status = "disconnected";
-          if (stopping) return;
-          const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-          if (statusCode === DisconnectReason.loggedOut) {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-            console.log("  Logged out. Re-linking...\n");
-          } else {
-            console.log("  Disconnected. Reconnecting...");
-          }
-          // Delay so a persistent failure (no network, server rejecting) doesn't spin a tight loop
-          setTimeout(() => startSocket(callbacks).then(resolve), RECONNECT_DELAY_MS);
-        }
-      }
+    sock.ev.process(async (events: any) => {
+      // A late event from a replaced socket must not touch the current state
+      if (sock !== this.sock) return;
 
       if (events["creds.update"]) {
-        await saveCreds();
+        this.saving = this.saving.then(saveCreds);
+        await this.saving;
+      }
+
+      const update = events["connection.update"];
+      if (!update) return;
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        this.qr = qr;
+        this.opts.onQR?.(qr, sock);
+      }
+
+      if (connection === "open") {
+        this.retryMs = MIN_RETRY_MS;
+        this.setStatus("open");
+      }
+
+      if (connection === "close") {
+        if (this.stopping) return;
+        const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const action = closeAction(statusCode, !!sock.authState.creds.me);
+        if (action === "logged_out") fs.rmSync(this.authDir, { recursive: true, force: true });
+        if (action !== "disconnected") {
+          this.stopping = true;
+          this.setStatus(action);
+          return;
+        }
+        this.setStatus("disconnected");
+        this.retryTimer = setTimeout(() => this.connect(), this.retryMs);
+        this.retryMs = nextRetryMs(this.retryMs);
       }
     });
-  });
+  }
+
+  private requireOpen() {
+    if (!this.sock || this.status !== "open") throw new Error(NOT_CONNECTED);
+  }
+
+  /** Phone number → its registered JID (handles older number formats); other JIDs pass through */
+  private async resolveJid(to: string): Promise<string> {
+    if (to.includes("@")) return to;
+    if (!/^\d{10,15}$/.test(to)) throw new Error("Invalid recipient. Use phone number, groupId@g.us, or channelId@newsletter");
+    const [result] = (await this.sock.onWhatsApp(to)) ?? [];
+    if (!result?.exists) throw new Error(NOT_ON_WHATSAPP);
+    return result.jid;
+  }
+
+  async sendTo(to: string, content: MessageContent) {
+    this.requireOpen();
+    const jid = await this.resolveJid(to);
+    const msg = buildBaileysContent(content);
+    // ponytail: one in-process queue; multiple instances on one number don't share pacing
+    const run = this.sendQueue.then(async () => {
+      await sleep(this.nextSendAt - Date.now());
+      try {
+        this.requireOpen();
+        await this.sock.sendMessage(jid, msg);
+      } finally {
+        const [min, max] = this.opts.sendGapMs ?? [3000, 6000];
+        this.nextSendAt = Date.now() + min + Math.random() * (max - min);
+      }
+    });
+    this.sendQueue = run.catch(() => {});
+    await run;
+    return { success: true, to: jid };
+  }
+
+  async listGroups() {
+    this.requireOpen();
+    const groups = await this.sock.groupFetchAllParticipating();
+    return Object.values(groups).map((g: any) => ({
+      id: g.id,
+      subject: g.subject,
+      size: g.size ?? g.participants?.length ?? 0,
+      desc: g.desc || null,
+    }));
+  }
 }

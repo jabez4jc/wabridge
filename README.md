@@ -40,7 +40,7 @@ Once linked, you can test messages interactively:
 Commands: /send, /self, /groups, /sendgroup, /sendchannel, /status, /disconnect, /quit
 ```
 
-Auth is saved to `~/.wabridge/` — you only need to link once.
+Auth is saved to `~/.wabridge/` (or `$WABRIDGE_HOME`), so you only need to link once.
 
 ### 2. Start the API Server
 
@@ -63,8 +63,20 @@ curl http://localhost:3000/status
 ```
 
 ```json
-{ "status": "open", "user": "919876543210@s.whatsapp.net" }
+{ "status": "open", "user": "919876543210:12@s.whatsapp.net", "phone": "919876543210", "qr": null }
 ```
+
+`status` is `connecting`, `open` or `disconnected` (retrying, with backoff from 3s up to 60s). These states are final and the bridge does not reconnect from them: `replaced` (another device took over the session), `logged_out` (unlinked from the phone), `unlinked` (QR code expired) and `stopped`. `qr` holds the current QR code while a link is pending.
+
+The server never exits on a session problem. If WhatsApp isn't linked, `wabridge start` stays up and puts the QR code in `/status`, so a dashboard can render it (for example with the `qrcode` package) and link the account without a terminal. After a final state, restart linking with:
+
+```bash
+curl -X POST http://localhost:3000/link -H 'Content-Type: application/json'
+```
+
+It returns `409` if the bridge is already connecting or connected.
+
+`/send` checks that the number is on WhatsApp first and returns `404 {"error": "Number is not on WhatsApp"}` if it isn't. Sends are spaced 3–6 seconds apart to lower the risk of a ban, so a request can wait behind earlier ones.
 
 ### List Groups
 
@@ -114,12 +126,18 @@ curl -X POST http://localhost:3000/send \
   -d '{"phone": "919876543210", "video": "https://example.com/video.mp4", "caption": "Watch this"}'
 ```
 
-### Send Voice Note
+### Send Audio / Voice Note
 
 ```bash
+# Audio file (MP3 by default)
 curl -X POST http://localhost:3000/send \
   -H 'Content-Type: application/json' \
-  -d '{"phone": "919876543210", "audio": "https://example.com/voice.ogg"}'
+  -d '{"phone": "919876543210", "audio": "https://example.com/song.mp3"}'
+
+# Voice note (OGG/Opus)
+curl -X POST http://localhost:3000/send \
+  -H 'Content-Type: application/json' \
+  -d '{"phone": "919876543210", "audio": "https://example.com/voice.ogg", "ptt": true}'
 ```
 
 ### Send Document
@@ -163,7 +181,7 @@ All send endpoints (`/send`, `/send/self`, `/send/group`, `/send/channel`) accep
 | `message` | string | — | Text message |
 | `image` | URL or file path | `caption?` | Image with optional caption |
 | `video` | URL or file path | `caption?` | Video with optional caption |
-| `audio` | URL or file path | `ptt?` (default: true) | Voice note or audio file |
+| `audio` | URL or file path | `ptt?` (default: false), `mimetype?` (default: `audio/mpeg`, or `audio/ogg; codecs=opus` when `ptt`) | Audio file, or voice note with `ptt: true` |
 | `document` | URL or file path | `mimetype` (required), `fileName?`, `caption?` | Document attachment |
 
 Media fields accept both remote URLs (`https://...`) and local file paths (`/path/to/file`). See [Security](#security).
@@ -206,7 +224,27 @@ Media fields accept both remote URLs (`https://...`) and local file paths (`/pat
 | Port | `3000` | `wabridge start 8080` or `PORT=8080 wabridge start` |
 | `HOST` | `127.0.0.1` | Interface to listen on. Non-loopback hosts require `WABRIDGE_API_KEY` |
 | `WABRIDGE_API_KEY` | — | When set, every request needs `Authorization: Bearer <key>` |
-| Auth | `~/.wabridge/auth_store` | WhatsApp session credentials |
+| `WABRIDGE_HOME` | `~/.wabridge` | Data folder. The session is kept in `$WABRIDGE_HOME/auth_store`. Give each instance (and each test run) its own folder |
+
+Only one machine should run a given session. If another device takes it over, the bridge stops instead of fighting for it. `SIGTERM`/`SIGINT` close the socket cleanly so the session is saved.
+
+## Use as a Library
+
+```ts
+import { WABridge } from "wabridge";
+
+const wa = new WABridge({
+  authDir: "/var/lib/myapp/wa",          // default: $WABRIDGE_HOME/auth_store
+  logger: myPinoLogger,                  // default: silent
+  onQR: (qr) => showQrInDashboard(qr),
+  onStatus: (status) => console.log("whatsapp:", status),
+  sendGapMs: [3000, 6000],
+});
+
+await wa.start();
+await wa.sendTo("919876543210", { type: "text", text: "Hello" });
+await wa.stop();
+```
 
 ## Security
 

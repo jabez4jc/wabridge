@@ -2,7 +2,7 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { bearerAuth } from "hono/bearer-auth";
-import { startSocket, getBridge, getMyJid, sendTo, listGroups } from "./socket.js";
+import { WABridge, NOT_CONNECTED, NOT_ON_WHATSAPP } from "./socket.js";
 import type { MessageContent } from "./socket.js";
 
 const API_PORT = Number(process.env.PORT) || 3000;
@@ -25,7 +25,9 @@ function parseMessageContent(body: any): MessageContent | string {
   const caption = str(body.caption);
   if (str(body.image)) return { type: "image", url: body.image, caption };
   if (str(body.video)) return { type: "video", url: body.video, caption };
-  if (str(body.audio)) return { type: "audio", url: body.audio, ptt: typeof body.ptt === "boolean" ? body.ptt : undefined };
+  if (str(body.audio)) {
+    return { type: "audio", url: body.audio, ptt: typeof body.ptt === "boolean" ? body.ptt : undefined, mimetype: str(body.mimetype) };
+  }
   if (str(body.document)) {
     if (!str(body.mimetype)) return "mimetype is required for document";
     return { type: "document", url: body.document, mimetype: body.mimetype, fileName: str(body.fileName), caption };
@@ -43,15 +45,17 @@ async function readBody(c: Context): Promise<any> {
   }
 }
 
+const ERROR_STATUS: Record<string, 404 | 503> = { [NOT_CONNECTED]: 503, [NOT_ON_WHATSAPP]: 404 };
+
 function errorResponse(c: Context, err: any) {
-  return c.json({ error: err.message }, err.message === "WhatsApp not connected" ? 503 : 500);
+  return c.json({ error: err.message }, ERROR_STATUS[err.message] ?? 500);
 }
 
 async function send(c: Context, to: string, body: any, display = to) {
   const content = parseMessageContent(body);
   if (typeof content === "string") return c.json({ error: content }, 400);
   try {
-    await sendTo(to, content);
+    await bridge.sendTo(to, content);
     return c.json({ success: true, to: display });
   } catch (err: any) {
     return errorResponse(c, err);
@@ -59,6 +63,27 @@ async function send(c: Context, to: string, body: any, display = to) {
 }
 
 // ─── HTTP API ─────────────────────────────────────────
+
+// Never exit on a session problem: stay up, report it in /status, and let POST /link
+// restart linking. Exiting would make systemd restart us in a loop.
+let qrShown = false;
+const bridge = new WABridge({
+  onQR() {
+    if (qrShown) return;
+    qrShown = true;
+    console.log("  WhatsApp is not linked. Scan the QR code from GET /status, or stop the server and run 'wabridge'.");
+  },
+  onStatus(status) {
+    if (status === "connecting") qrShown = false;
+    if (status === "open") console.log("  WhatsApp connected!");
+    if (status === "disconnected") console.log("  Disconnected. Reconnecting...");
+    if (status === "replaced") console.error("  Session taken over by another device. Not reconnecting; POST /link to take it back.");
+    if (status === "logged_out") console.error("  Logged out from the phone. Re-link needed: POST /link, then scan the QR code from GET /status.");
+    if (status === "unlinked") console.error("  QR code expired. POST /link to get a new one.");
+  },
+});
+
+const LIVE = new Set(["connecting", "open", "disconnected"]);
 
 const app = new Hono();
 
@@ -81,16 +106,24 @@ app.use("*", async (c, next) => {
 });
 
 app.get("/status", (c) => {
-  const bridge = getBridge();
   return c.json({
     status: bridge.status,
     user: bridge.sock?.user?.id || null,
+    phone: bridge.phone,
+    qr: bridge.qr,
   });
+});
+
+// Restart connecting after a terminal status; poll /status for the QR code
+app.post("/link", async (c) => {
+  if (LIVE.has(bridge.status)) return c.json({ error: `Already ${bridge.status}` }, 409);
+  await bridge.start();
+  return c.json({ status: bridge.status });
 });
 
 app.get("/groups", async (c) => {
   try {
-    const groups = await listGroups();
+    const groups = await bridge.listGroups();
     return c.json({ groups });
   } catch (err: any) {
     return errorResponse(c, err);
@@ -111,8 +144,8 @@ app.post("/send", async (c) => {
 app.post("/send/self", async (c) => {
   const body = await readBody(c);
   if (!body) return c.json({ error: "Invalid JSON body" }, 400);
-  const myJid = getMyJid();
-  if (!myJid) return c.json({ error: "WhatsApp not connected" }, 503);
+  const myJid = bridge.jid;
+  if (!myJid) return c.json({ error: NOT_CONNECTED }, 503);
   return send(c, myJid, body, "self");
 });
 
@@ -145,6 +178,7 @@ serve({ fetch: app.fetch, port: API_PORT, hostname: API_HOST }, () => {
     "  ║           WABridge API - Running                 ║",
     "  ╠══════════════════════════════════════════════════╣",
     "  ║  GET  /status        - Connection status         ║",
+    "  ║  POST /link          - Restart linking (QR)      ║",
     "  ║  GET  /groups        - List groups               ║",
     "  ║  POST /send          - Send to phone number      ║",
     "  ║  POST /send/self     - Send to yourself          ║",
@@ -157,12 +191,11 @@ serve({ fetch: app.fetch, port: API_PORT, hostname: API_HOST }, () => {
   ].join("\n"));
 });
 
-startSocket({
-  onQR() {
-    console.error("  WhatsApp is not linked. Run 'wabridge' to link, then start the server again.");
-    process.exit(1);
-  },
-  onOpen() {
-    console.log("  WhatsApp connected!");
-  },
-});
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, async () => {
+    await bridge.stop();
+    process.exit(0);
+  });
+}
+
+bridge.start();

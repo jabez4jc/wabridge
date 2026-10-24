@@ -10,6 +10,27 @@ const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-
 
 const command = process.argv[2];
 
+// libsignal prints failed decrypts of incoming messages as raw errors with stack traces.
+// Reword them for the terminal: one line per message, with an explanation the first time.
+const consoleError = console.error;
+let decryptExplained = false;
+console.error = (...args: unknown[]) => {
+  const line = String(args[0]);
+  if (line === "Failed to decrypt message with any known session...") return;
+  if (line.startsWith("Session error:")) {
+    const reason = line.slice("Session error:".length).replace(/^Error: /, "");
+    consoleError(`\n  Could not decrypt an incoming message (${reason}).`);
+    if (!decryptExplained) {
+      decryptExplained = true;
+      consoleError("  The sender's encryption keys don't match this session. Sending is not affected.");
+      consoleError("  A few right after linking are normal. If it keeps happening, another machine");
+      consoleError("  is probably using this same session folder: run it on one machine only.");
+    }
+    return;
+  }
+  consoleError(...args);
+};
+
 if (command === "--version" || command === "-v") {
   console.log(`wabridge/${pkg.version}`);
 } else if (command === "--help" || command === "-h") {
@@ -22,7 +43,8 @@ Commands:
   start [port]   Start the API server (default port: 3000)
 
 API Endpoints:
-  GET  /status        Connection status
+  GET  /status        Connection status (and QR code while linking)
+  POST /link          Restart linking after logout, takeover or QR expiry
   GET  /groups        List groups
   POST /send          Send to phone (text, image, video, audio, document)
   POST /send/self     Send to yourself
@@ -37,7 +59,8 @@ Options:
 Environment:
   PORT              API port (default: 3000)
   HOST              Listen address (default: 127.0.0.1)
-  WABRIDGE_API_KEY  Require "Authorization: Bearer <key>" on every request`);
+  WABRIDGE_API_KEY  Require "Authorization: Bearer <key>" on every request
+  WABRIDGE_HOME     Data folder holding the session (default: ~/.wabridge)`);
 } else if (command === "start") {
   const port = process.argv[3];
   if (port) process.env.PORT = port;

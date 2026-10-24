@@ -1,4 +1,4 @@
-import { startSocket, sendTo, listGroups, disconnect, getBridge, getMyJid } from "./socket.js";
+import { WABridge } from "./socket.js";
 // @ts-ignore no types available
 import QRCode from "qrcode";
 import * as readline from "readline";
@@ -8,19 +8,10 @@ const ask = (prompt: string) => new Promise<string>((resolve) => rl.question(pro
 
 const usePairingCode = process.argv.includes("--code");
 
-console.log(`
-  ╔══════════════════════════════════════╗
-  ║        WABridge - Setup              ║
-  ╠══════════════════════════════════════╣
-  ║  Link your WhatsApp account          ║
-  ║  Auth is saved to ~/.wabridge/       ║
-  ╚══════════════════════════════════════╝
-`);
-
 let promptStarted = false;
 let pairingRequested = false;
 
-await startSocket({
+const bridge = new WABridge({
   async onQR(qr, sock) {
     if (usePairingCode) {
       if (!pairingRequested) {
@@ -41,30 +32,61 @@ await startSocket({
       console.log(qrText);
     }
   },
-  onOpen() {
-    console.log("  WhatsApp linked successfully!\n");
-    if (!promptStarted) {
-      promptStarted = true;
-      console.log("  Commands: /send, /self, /groups, /sendgroup, /sendchannel, /status, /disconnect, /quit\n");
-      promptLoop();
+  onStatus(status) {
+    if (status === "open") {
+      console.log("  WhatsApp linked successfully!\n");
+      if (!promptStarted) {
+        promptStarted = true;
+        console.log("  Commands: /send, /self, /groups, /sendgroup, /sendchannel, /status, /disconnect, /quit\n");
+        promptLoop();
+      }
+    }
+    if (status === "disconnected") console.log("  Disconnected. Reconnecting...");
+    if (status === "unlinked") {
+      console.log("  QR code expired. Run 'wabridge' again to link.");
+      process.exit(1);
+    }
+    if (status === "replaced") {
+      console.log("  Session taken over by another device. Stopping.");
+      process.exit(1);
+    }
+    if (status === "logged_out") {
+      console.log("  Logged out. Re-linking...\n");
+      bridge.start();
     }
   },
 });
+
+async function shutdown() {
+  await bridge.stop();
+  console.log("  Bye!");
+  process.exit(0);
+}
+
+rl.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+console.log(`
+  ╔══════════════════════════════════════╗
+  ║        WABridge - Setup              ║
+  ╠══════════════════════════════════════╣
+  ║  Link your WhatsApp account          ║
+  ╚══════════════════════════════════════╝
+  Session folder: ${bridge.authDir}
+`);
+
+await bridge.start();
 
 async function promptLoop() {
   while (true) {
     const input = (await ask("  > ")).trim();
     if (!input) continue;
 
-    if (input === "/quit") {
-      console.log("  Bye!");
-      process.exit(0);
-    }
+    if (input === "/quit") await shutdown();
 
     if (input === "/status") {
-      const b = getBridge();
-      console.log(`  Status: ${b.status}`);
-      console.log(`  JID: ${getMyJid() || "N/A"}`);
+      console.log(`  Status: ${bridge.status}`);
+      console.log(`  JID: ${bridge.jid || "N/A"}`);
       continue;
     }
 
@@ -77,7 +99,7 @@ async function promptLoop() {
       const msg = (await ask("  Message: ")).trim();
       if (!msg) { console.log("  Cancelled."); continue; }
       try {
-        await sendTo(phone, { type: "text", text: msg });
+        await bridge.sendTo(phone, { type: "text", text: msg });
         console.log(`  Sent to +${phone}!`);
       } catch (err: any) {
         console.log(`  Failed: ${err.message}`);
@@ -89,9 +111,9 @@ async function promptLoop() {
       const msg = (await ask("  Message to self: ")).trim();
       if (!msg) { console.log("  Cancelled."); continue; }
       try {
-        const myJid = getMyJid();
+        const myJid = bridge.jid;
         if (!myJid) throw new Error("WhatsApp not connected");
-        await sendTo(myJid, { type: "text", text: msg });
+        await bridge.sendTo(myJid, { type: "text", text: msg });
         console.log("  Sent to yourself!");
       } catch (err: any) {
         console.log(`  Failed: ${err.message}`);
@@ -101,7 +123,7 @@ async function promptLoop() {
 
     if (input === "/groups") {
       try {
-        const groups = await listGroups();
+        const groups = await bridge.listGroups();
         if (groups.length === 0) {
           console.log("  No groups found.");
         } else {
@@ -129,7 +151,7 @@ async function promptLoop() {
       const msg = (await ask("  Message: ")).trim();
       if (!msg) { console.log("  Cancelled."); continue; }
       try {
-        await sendTo(groupId, { type: "text", text: msg });
+        await bridge.sendTo(groupId, { type: "text", text: msg });
         console.log("  Sent to group!");
       } catch (err: any) {
         console.log(`  Failed: ${err.message}`);
@@ -146,7 +168,7 @@ async function promptLoop() {
       const msg = (await ask("  Message: ")).trim();
       if (!msg) { console.log("  Cancelled."); continue; }
       try {
-        await sendTo(channelId, { type: "text", text: msg });
+        await bridge.sendTo(channelId, { type: "text", text: msg });
         console.log("  Sent to channel!");
       } catch (err: any) {
         console.log(`  Failed: ${err.message}`);
@@ -158,7 +180,7 @@ async function promptLoop() {
       const confirm = (await ask("  Unlink WhatsApp? This removes saved auth. (y/n): ")).trim().toLowerCase();
       if (confirm === "y") {
         try {
-          await disconnect();
+          await bridge.logout();
           console.log("  WhatsApp unlinked. Run 'wabridge' again to re-link.");
           process.exit(0);
         } catch (err: any) {
