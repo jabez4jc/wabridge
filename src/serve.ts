@@ -167,6 +167,15 @@ app.post("/send/channel", async (c) => {
   return send(c, channelId, body);
 });
 
+app.get("/channel/resolve", async (c) => {
+  const invite = (c.req.query("invite") || "").split("/").pop();
+  if (!invite) return c.json({ error: "invite is required" }, 400);
+  try {
+    const meta: any = await (bridge as any).sock.newsletterMetadata("invite", invite);
+    return c.json({ id: meta?.id, name: meta?.thread_metadata?.name?.text ?? meta?.name, meta });
+  } catch (e: any) { return c.json({ error: String(e?.message || e) }, 500); }
+});
+
 // ─── Start ────────────────────────────────────────────
 
 serve({ fetch: app.fetch, port: API_PORT, hostname: API_HOST }, () => {
